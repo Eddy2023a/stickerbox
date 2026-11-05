@@ -1,0 +1,258 @@
+[
+  {
+    "id": "6042fcfa3cea94f11b4058f21a90f794",
+    "md5": "6042fcfa3cea94f11b4058f21a90f794",
+    "width": 240,
+    "height": 240,
+    "url": "template-01.gif",
+    "thumbnailUrl": "template-01.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.05000000074505806
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.17499999701976776
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "edd2c43763faee640d1ab637be33ca07",
+    "md5": "edd2c43763faee640d1ab637be33ca07",
+    "width": 300,
+    "height": 300,
+    "url": "template-02.png",
+    "thumbnailUrl": "template-02.png",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.824999988079071
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.949999988079071
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "ff3e206f634d4281746bf5fb410e7ab2",
+    "md5": "ff3e206f634d4281746bf5fb410e7ab2",
+    "width": 240,
+    "height": 240,
+    "url": "template-03.gif",
+    "thumbnailUrl": "template-03.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.824999988079071
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.949999988079071
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "90f57b9e892bdb88acabdb06bb18e4fa",
+    "md5": "90f57b9e892bdb88acabdb06bb18e4fa",
+    "width": 270,
+    "height": 270,
+    "url": "template-04.gif",
+    "thumbnailUrl": "template-04.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.05000000074505806
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.17499999701976776
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "141977459f5637125738ee525d944bb6",
+    "md5": "141977459f5637125738ee525d944bb6",
+    "width": 240,
+    "height": 240,
+    "url": "template-05.gif",
+    "thumbnailUrl": "template-05.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.824999988079071
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.949999988079071
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "f5116933bb8980de5ce9560259235311",
+    "md5": "f5116933bb8980de5ce9560259235311",
+    "width": 240,
+    "height": 240,
+    "url": "template-06.gif",
+    "thumbnailUrl": "template-06.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.05000000074505806
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.17499999701976776
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "8397d77a0e58761e1cb0c9d590667517",
+    "md5": "8397d77a0e58761e1cb0c9d590667517",
+    "width": 500,
+    "height": 500,
+    "url": "template-07.gif",
+    "thumbnailUrl": "template-07.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.05000000074505806
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.17499999701976776
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  },
+  {
+    "id": "bd327f55087acf75ae01de031460959e",
+    "md5": "bd327f55087acf75ae01de031460959e",
+    "width": 240,
+    "height": 240,
+    "url": "template-08.gif",
+    "thumbnailUrl": "template-08.gif",
+    "composition": {
+      "bBox": {
+        "topLeft": {
+          "x": 0.05000000074505806,
+          "y": 0.05000000074505806
+        },
+        "bottomRight": {
+          "x": 0.949999988079071,
+          "y": 0.17499999701976776
+        }
+      },
+      "textColor": {
+        "red": 0,
+        "green": 0,
+        "blue": 0,
+        "alpha": 255
+      },
+      "shadowColor": {
+        "red": 255,
+        "green": 255,
+        "blue": 255,
+        "alpha": 255
+      }
+    }
+  }
+]
