@@ -3,6 +3,7 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 import CryptoKit
+import ApplicationServices
 
 struct XY: Codable { let x: Double; let y: Double }
 struct TextBox: Codable { let topLeft: XY; let bottomRight: XY }
@@ -58,6 +59,7 @@ final class QQClient {
         configuration.connectionProxyDictionary = [:]
         session = URLSession(configuration: configuration)
     }
+    deinit { session.invalidateAndCancel() }
     func cancel() { requestGeneration += 1; searchTask?.cancel(); searchTask = nil }
     func reconnect() {
         connection = nil
@@ -136,7 +138,7 @@ enum Render {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
-    static func thumbnail(_ data: Data, pixels: Int = 180) -> CGImage? {
+    static func thumbnail(_ data: Data, pixels: Int = 144) -> CGImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: pixels, kCGImageSourceShouldCacheImmediately: true, kCGImageSourceCreateThumbnailWithTransform: true]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
@@ -233,16 +235,19 @@ final class ImageLoader {
     private let session: URLSession
     private let lock = NSLock()
     private var tasks: [UUID: URLSessionDataTask] = [:]
+    private var generation = 0
     init() {
-        cache.totalCostLimit = 10 * 1024 * 1024
-        cache.countLimit = 72
+        cache.totalCostLimit = 4 * 1024 * 1024
+        cache.countLimit = 32
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpMaximumConnectionsPerHost = 4
+        configuration.httpMaximumConnectionsPerHost = 2
         configuration.urlCache = nil
         configuration.timeoutIntervalForRequest = 15
         session = URLSession(configuration: configuration)
     }
+    deinit { session.invalidateAndCancel() }
     func load(_ sticker: Sticker, text: String?, completion: @escaping (NSImage?) -> Void) {
+        lock.lock(); let ticket = generation; lock.unlock()
         let key = (sticker.md5 + "|" + (text ?? "")) as NSString
         if let image = cache.object(forKey: key) { completion(image); return }
         guard let url = URL(string: sticker.thumbnailUrl.isEmpty ? sticker.url : sticker.thumbnailUrl) else { completion(nil); return }
@@ -252,7 +257,9 @@ final class ImageLoader {
                 if let data = try? Data(contentsOf: url), var cg = Render.thumbnail(data) {
                     if let text = text, let composition = sticker.composition, let rendered = Render.composed(cg, text: text, info: composition) { cg = rendered }
                     image = NSImage(cgImage: cg, size: NSSize(width: cg.width / 2, height: cg.height / 2))
-                    self.cache.setObject(image!, forKey: key, cost: cg.width * cg.height * 4)
+                    self.lock.lock()
+                    if ticket == self.generation { self.cache.setObject(image!, forKey: key, cost: cg.width * cg.height * 4) }
+                    self.lock.unlock()
                 }
                 DispatchQueue.main.async { completion(image) }
             }
@@ -266,14 +273,16 @@ final class ImageLoader {
             if let text = text, let composition = sticker.composition, let original = cg { cg = Render.composed(original, text: text, info: composition) }
             guard let image = cg else { DispatchQueue.main.async { completion(nil) }; return }
             let nsImage = NSImage(cgImage: image, size: NSSize(width: image.width / 2, height: image.height / 2))
-            self.cache.setObject(nsImage, forKey: key, cost: image.width * image.height * 4)
+            self.lock.lock()
+            if ticket == self.generation { self.cache.setObject(nsImage, forKey: key, cost: image.width * image.height * 4) }
+            self.lock.unlock()
             DispatchQueue.main.async { completion(nsImage) }
         }
         lock.lock(); tasks[id] = task; lock.unlock(); task.resume()
     }
     func clear() {
-        lock.lock(); let active = Array(tasks.values); tasks.removeAll(); lock.unlock()
-        active.forEach { $0.cancel() }; cache.removeAllObjects()
+        lock.lock(); generation += 1; let active = Array(tasks.values); tasks.removeAll(); cache.removeAllObjects(); lock.unlock()
+        active.forEach { $0.cancel() }
     }
 }
 
@@ -328,7 +337,7 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
     private var copying = false
     private var requestedQuery: String?
     private lazy var bundledTemplates = Sticker.bundled()
-    var didCopy: (() -> Void)?
+    var didCopy: ((Int) -> Void)?
     var inputText: String { searchField.currentEditor()?.string ?? searchField.stringValue }
 
     override func loadView() {
@@ -400,7 +409,7 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
         else if !searchField.stringValue.isEmpty { performSearch() }
     }
     func closed() {
-        generation += 1; debounce?.cancel(); client.cancel(); images.clear()
+        generation += 1; debounce?.cancel(); debounce = nil; client.cancel(); images.clear(); result = nil
         requestedQuery = nil
         for item in collection.visibleItems() { (item as? StickerItem)?.button.image = nil }
         items = []; collection.reloadData()
@@ -506,6 +515,7 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
     private func copy(_ sticker: Sticker, text: String?) {
         guard !copying, let url = URL(string: sticker.url) else { return }
         if let text = text, text.isEmpty { status.stringValue = "先输入想放在表情上的文字"; return }
+        let afterCopy = didCopy
         copying = true; spinner.startAnimation(nil); status.stringValue = text == nil ? "正在复制原图…" : "正在合成并复制…"
         let finish: (Data?, Error?) -> Void = { data, error in
             var outcome: Result<URL, Error>
@@ -521,7 +531,8 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
                     let animated = try Render.copy(file)
                     self.status.stringValue = animated ? "已复制动图，可直接粘贴" : "已复制图片，可直接粘贴"
                     DispatchQueue.global(qos: .utility).async { Render.trimDiskCache() }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { self.didCopy?() }
+                    let clipboardVersion = NSPasteboard.general.changeCount
+                    afterCopy?(clipboardVersion)
                 } catch { self.status.stringValue = error.localizedDescription }
             }
         }
@@ -539,13 +550,165 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class FeishuContextMenu: NSObject {
+    var search: ((String, NSPoint) -> Void)?
+    private var tap: CFMachPort?
+    private var source: CFRunLoopSource?
+    private var permissionObserver: NSObjectProtocol?
+    private var suppressUp = false
+    private var menuOpen = false
+    private var target: NSRunningApplication?
+    private var point = NSPoint.zero
+    private var click = CGPoint.zero
+    private let replayTag: Int64 = 0x53544258
+    var isRunning: Bool { tap != nil }
+    var sourceApplication: NSRunningApplication? { target }
+
+    func start() {
+        install()
+        guard tap == nil else { return }
+        permissionObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.install() }
+    }
+    func requestPermission() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        install()
+    }
+    private func install() {
+        guard tap == nil else { return }
+        let trusted = AXIsProcessTrusted()
+        try? "accessibility=\(trusted)\n".write(toFile: NSTemporaryDirectory() + "stickerbox-menu-status.txt", atomically: true, encoding: .utf8)
+        guard trusted else { return }
+        let callback: CGEventTapCallBack = { _, type, event, context in
+            guard let context = context else { return Unmanaged.passUnretained(event) }
+            let owner = Unmanaged<FeishuContextMenu>.fromOpaque(context).takeUnretainedValue()
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                owner.suppressUp = false
+                if let tap = owner.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                return Unmanaged.passUnretained(event)
+            }
+            if event.getIntegerValueField(.eventSourceUserData) == owner.replayTag { return Unmanaged.passUnretained(event) }
+            if type == .rightMouseUp, owner.suppressUp { owner.suppressUp = false; return nil }
+            guard type == .rightMouseDown, !owner.menuOpen,
+                  let app = NSWorkspace.shared.frontmostApplication,
+                  ["com.electron.lark", "com.electron.feishu"].contains(app.bundleIdentifier ?? "") else {
+                return Unmanaged.passUnretained(event)
+            }
+            owner.suppressUp = true
+            owner.target = app; owner.click = event.location
+            owner.point = NSPoint(x: event.location.x, y: (NSScreen.screens.first?.frame.maxY ?? 0) - event.location.y)
+            DispatchQueue.main.async { owner.showMenu() }
+            return nil
+        }
+        let mask = CGEventMask((1 << CGEventType.rightMouseDown.rawValue) | (1 << CGEventType.rightMouseUp.rawValue))
+        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                               eventsOfInterest: mask, callback: callback, userInfo: Unmanaged.passUnretained(self).toOpaque())
+        try? "accessibility=true eventTap=\(tap != nil)\n".write(toFile: NSTemporaryDirectory() + "stickerbox-menu-status.txt", atomically: true, encoding: .utf8)
+        if let tap = tap {
+            if let observer = permissionObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(observer); permissionObserver = nil
+            }
+            source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
+    private func showMenu() {
+        guard !menuOpen else { return }
+        menuOpen = true
+        let menu = NSMenu()
+        for (title, action) in [("复制", #selector(copyText)), ("剪切", #selector(cutText)), ("粘贴", #selector(pasteText))] {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: ""); item.target = self
+        }
+        menu.addItem(.separator())
+        let searchItem = menu.addItem(withTitle: "表情搜索", action: #selector(searchText), keyEquivalent: "")
+        searchItem.target = self
+        menu.addItem(.separator())
+        let original = menu.addItem(withTitle: "飞书原右键菜单", action: #selector(originalMenu), keyEquivalent: "")
+        original.target = self
+        menu.popUp(positioning: nil, at: point, in: nil)
+        menuOpen = false
+    }
+    private func sendCommand(_ key: CGKeyCode, completion: (() -> Void)? = nil) {
+        guard let app = target, !app.isTerminated else { return }
+        app.activate(options: [.activateIgnoringOtherApps])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
+            for down in [true, false] {
+                let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down)
+                event?.flags = .maskCommand
+                event?.postToPid(app.processIdentifier)
+            }
+            completion?()
+        }
+    }
+    @objc private func copyText() { sendCommand(8) }
+    @objc private func cutText() { sendCommand(7) }
+    @objc private func pasteText() { sendCommand(9) }
+    @objc private func originalMenu() {
+        let location = click
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            for type in [CGEventType.rightMouseDown, .rightMouseUp] {
+                let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: .right)
+                event?.setIntegerValueField(.eventSourceUserData, value: self.replayTag)
+                event?.post(tap: .cghidEventTap)
+            }
+        }
+    }
+    @objc private func searchText() {
+        let board = NSPasteboard.general
+        // Snapshot every advertised format before using Copy to read Electron's selection.
+        let saved = (board.pasteboardItems ?? []).map { item -> NSPasteboardItem in
+            let snapshot = NSPasteboardItem()
+            for type in item.types { if let data = item.data(forType: type) { snapshot.setData(data, forType: type) } }
+            return snapshot
+        }
+        let before = board.changeCount
+        let anchor = point
+        sendCommand(8) { self.waitForCopy(previous: before, saved: saved, anchor: anchor, attempts: 16) }
+    }
+    private func waitForCopy(previous: Int, saved: [NSPasteboardItem], anchor: NSPoint, attempts: Int) {
+        let board = NSPasteboard.general
+        if board.changeCount != previous {
+            let copiedVersion = board.changeCount
+            let text = board.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if board.changeCount == copiedVersion {
+                board.clearContents()
+                if !saved.isEmpty { board.writeObjects(saved) }
+            }
+            // Empty / oversized selections open an editable search field without sending a query.
+            search?(text.count <= 100 ? text : "", anchor)
+        } else if attempts > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.waitForCopy(previous: previous, saved: saved, anchor: anchor, attempts: attempts - 1)
+            }
+        } else { search?("", anchor) }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover?
     private var panel: PanelController?
     private var previewWindow: NSWindow?
+    private var selectionWindow: NSPanel?
+    private var selectionController: PanelController?
+    private var outsideClickMonitor: Any?
+    private let feishuMenu = FeishuContextMenu()
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        feishuMenu.search = { [weak self] text, point in
+            guard let self = self else { return }
+            self.showSelection(text, at: point, source: self.feishuMenu.sourceApplication)
+        }
+        feishuMenu.start()
+        if CommandLine.arguments.contains("--enable-feishu") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.feishuMenu.requestPermission() }
+        }
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "表情匣")
@@ -578,6 +741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let menu = NSMenu()
             menu.addItem(withTitle: "打开表情匣", action: #selector(showMenu), keyEquivalent: "")
             menu.addItem(withTitle: "打开 QQ 调试副本", action: #selector(openQQ), keyEquivalent: "")
+            menu.addItem(withTitle: feishuMenu.isRunning ? "飞书右键菜单已启用" : "启用飞书右键菜单…", action: #selector(enableFeishuMenu), keyEquivalent: "")
             menu.addItem(NSMenuItem.separator())
             menu.addItem(withTitle: "退出表情匣", action: #selector(quit), keyEquivalent: "q")
             menu.items.forEach { $0.target = self }
@@ -585,6 +749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else if popover?.isShown == true { popover?.performClose(nil) }
         else { show() }
     }
+    @objc private func enableFeishuMenu() { feishuMenu.requestPermission() }
     @objc private func showMenu() { show() }
     @objc private func previewClipboard() {
         if let controller = previewWindow?.contentViewController as? PanelController {
@@ -597,11 +762,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/StickerBox/QQ-debug.app")
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
     }
+    @objc func searchEmoji(_ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        guard let raw = pasteboard.string(forType: .string) else {
+            error.pointee = "请先选中文字。"; return
+        }
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= 100 else {
+            error.pointee = "请选择 1 到 100 字的搜索关键词。"; return
+        }
+        let point = NSEvent.mouseLocation
+        let source = NSWorkspace.shared.frontmostApplication
+        DispatchQueue.main.async { [weak self] in self?.showSelection(text, at: point, source: source) }
+    }
+    private func finishCopy(to source: NSRunningApplication?, clipboardVersion: Int) {
+        let front = NSWorkspace.shared.frontmostApplication
+        let mayReturn = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier || front?.processIdentifier == source?.processIdentifier
+        closeSelection(); popover?.performClose(nil)
+        NSApp.hide(nil)
+        guard mayReturn, AXIsProcessTrusted(), let source = source, !source.isTerminated,
+              ["com.electron.lark", "com.electron.feishu"].contains(source.bundleIdentifier ?? "") else { return }
+        source.activate(options: [.activateIgnoringOtherApps])
+        // Wait for the original editor to regain focus, then paste once. Never send Return.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == source.processIdentifier,
+                  NSPasteboard.general.changeCount == clipboardVersion else { return }
+            for down in [true, false] {
+                let event = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: down)
+                event?.flags = .maskCommand
+                event?.postToPid(source.processIdentifier)
+            }
+        }
+    }
+    private func closeSelection() {
+        selectionWindow?.delegate = nil
+        selectionWindow?.orderOut(nil)
+        selectionController?.closed()
+        selectionWindow?.contentViewController = nil
+        selectionController = nil; selectionWindow = nil
+        if let monitor = outsideClickMonitor { NSEvent.removeMonitor(monitor); outsideClickMonitor = nil }
+    }
+    func windowDidResignKey(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === selectionWindow { closeSelection() }
+    }
+    private func showSelection(_ text: String, at point: NSPoint, source: NSRunningApplication?) {
+        popover?.performClose(nil)
+        if selectionWindow == nil {
+            let controller = PanelController()
+            controller.didCopy = { [weak self] version in self?.finishCopy(to: source, clipboardVersion: version) }
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 624, height: 560),
+                                 styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+            window.title = "表情匣"; window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true; window.isMovableByWindowBackground = true
+            window.level = .popUpMenu; window.delegate = self
+            window.contentViewController = controller
+            selectionWindow = window; selectionController = controller
+        }
+        guard let window = selectionWindow else { return }
+        let screen = NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) } ?? NSScreen.main
+        let bounds = (screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)).insetBy(dx: 8, dy: 8)
+        let size = window.frame.size
+        let x = min(max(point.x + 8, bounds.minX), max(bounds.minX, bounds.maxX - size.width))
+        let y = min(max(point.y - size.height - 8, bounds.minY), max(bounds.minY, bounds.maxY - size.height))
+        window.setFrameOrigin(NSPoint(x: x, y: y))
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        selectionController?.loadQuery(text); selectionController?.focusSearch()
+        if outsideClickMonitor == nil {
+            outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.closeSelection() }
+        }
+    }
     private func show() {
+        let source = NSWorkspace.shared.frontmostApplication
+        closeSelection()
         guard let button = statusItem.button else { return }
         if panel == nil {
-            let controller = PanelController(); controller.didCopy = { [weak self] in
-                self?.popover?.performClose(nil); NSApp.hide(nil)
+            let controller = PanelController(); controller.didCopy = { [weak self] version in
+                self?.finishCopy(to: source, clipboardVersion: version)
                 self?.statusItem.button?.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "已复制")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.statusItem.button?.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "表情匣") }
             }
@@ -613,7 +849,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel?.open(); panel?.focusSearch()
         if CommandLine.arguments.contains("--preview") { fputs("POPOVER_VISIBLE \(popover?.isShown == true) STATUS_VISIBLE \(statusItem.isVisible)\n", stderr) }
     }
-    func popoverDidClose(_ notification: Notification) { panel?.closed() }
+    func popoverDidClose(_ notification: Notification) {
+        panel?.closed()
+        popover?.contentViewController = nil
+        panel = nil; popover = nil
+    }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { show(); return true }
     @objc private func quit() { NSApp.terminate(nil) }
 }
