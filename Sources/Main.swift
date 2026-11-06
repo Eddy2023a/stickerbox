@@ -177,7 +177,7 @@ enum Render {
         if let text = text, let composition = sticker.composition {
             let animated = count > 1
             let destination = cache.appendingPathComponent(key + (animated ? ".gif" : ".png"))
-            if FileManager.default.fileExists(atPath: destination.path) { return destination }
+            if FileManager.default.fileExists(atPath: destination.path) { return try forChat(destination) }
             let outputType = animated ? UTType.gif.identifier : UTType.png.identifier
             guard let output = CGImageDestinationCreateWithURL(destination as CFURL, outputType as CFString, animated ? count : 1, nil) else { throw AppError.message("无法保存合成表情。") }
             if animated {
@@ -194,16 +194,55 @@ enum Render {
                 }
             }
             guard CGImageDestinationFinalize(output) else { try? FileManager.default.removeItem(at: destination); throw AppError.message("合成失败，请换一个模板。") }
-            return destination
+            return try forChat(destination)
         }
         let ext = type?.preferredFilenameExtension ?? "gif"
         let file = cache.appendingPathComponent(key + "." + ext)
         if !FileManager.default.fileExists(atPath: file.path) { try data.write(to: file, options: .atomic) }
-        return file
+        return try forChat(file)
     }
-    static func copy(_ file: URL) throws -> Bool {
+    static let chatMaxPixels = 160
+    static func forChat(_ file: URL) throws -> URL {
+        guard let source = CGImageSourceCreateWithURL(file as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let info = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = info[kCGImagePropertyPixelWidth] as? Int,
+              let height = info[kCGImagePropertyPixelHeight] as? Int else { throw AppError.message("无法读取表情尺寸。") }
+        guard max(width, height) > chatMaxPixels else { return file }
+        let frames = CGImageSourceGetCount(source), animated = frames > 1
+        let output = cache.appendingPathComponent("chat160-" + hash(file.lastPathComponent) + (animated ? ".gif" : ".png"))
+        if FileManager.default.fileExists(atPath: output.path) { return output }
+        let temporary = output.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".tmp")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        guard let destination = CGImageDestinationCreateWithURL(temporary as CFURL, (animated ? UTType.gif.identifier : UTType.png.identifier) as CFString, frames, nil) else {
+            throw AppError.message("无法缩小表情。")
+        }
+        if animated {
+            let properties = CGImageSourceCopyProperties(source, nil) as? [CFString: Any]
+            CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: properties?[kCGImagePropertyGIFDictionary] ?? [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        }
+        for index in 0..<frames {
+            let added = autoreleasepool { () -> Bool in
+                guard let image = CGImageSourceCreateThumbnailAtIndex(source, index, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: chatMaxPixels,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true
+                ] as CFDictionary) else { return false }
+                let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+                let frameProperties: CFDictionary? = animated ? [kCGImagePropertyGIFDictionary: properties?[kCGImagePropertyGIFDictionary] ?? [:]] as CFDictionary : nil
+                CGImageDestinationAddImage(destination, image, frameProperties)
+                return true
+            }
+            guard added else { throw AppError.message("表情某一帧无法缩小，未复制或发送。") }
+        }
+        guard CGImageDestinationFinalize(destination) else { throw AppError.message("表情缩小失败。") }
+        try FileManager.default.moveItem(at: temporary, to: output)
+        return output
+    }
+    static func copy(_ originalFile: URL) throws -> Bool {
+        let file = try forChat(originalFile)
         let data = try Data(contentsOf: file, options: .mappedIfSafe)
-        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary), let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 640] as CFDictionary) else { throw AppError.message("无法复制图片。") }
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary), let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 160] as CFDictionary) else { throw AppError.message("无法复制图片。") }
         let item = NSPasteboardItem()
         item.setString(file.absoluteString, forType: .fileURL)
         let animated = CGImageSourceGetCount(source) > 1
@@ -493,7 +532,7 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
             emptyDetail.stringValue = tab == 0 ? "换个关键词试试" : "试试更短的文字，比如“开心”或“娃哈哈”"
         }
         if tab == 1 { status.stringValue = "\(items.count) 个模板 · 本地合成，点击复制" }
-        else if let result = result { status.stringValue = "“\(result.query)” · \(items.count) 个表情 · 点击复制原图" }
+        else if let result = result { status.stringValue = "“\(result.query)” · \(items.count) 个表情 · 点击复制表情" }
     }
     func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int { items.count }
     func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
@@ -504,7 +543,7 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
         cell.key = key
         cell.button.image = NSImage(systemSymbolName: "photo", accessibilityDescription: nil)
         cell.button.setAccessibilityLabel((tab == 0 ? "表情 " : "合成模板 ") + String(indexPath.item + 1))
-        cell.button.toolTip = tab == 0 ? "点击复制原图（保留动图）" : "点击合成并复制"
+        cell.button.toolTip = tab == 0 ? "点击复制标准尺寸表情（保留动图）" : "点击合成并复制"
         cell.action = { [weak self] in self?.copy(sticker, text: text) }
         images.load(sticker, text: text) { [weak cell] image in
             guard let cell = cell, cell.key == key else { return }
@@ -516,7 +555,7 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
         guard !copying, let url = URL(string: sticker.url) else { return }
         if let text = text, text.isEmpty { status.stringValue = "先输入想放在表情上的文字"; return }
         let afterCopy = didCopy
-        copying = true; spinner.startAnimation(nil); status.stringValue = text == nil ? "正在复制原图…" : "正在合成并复制…"
+        copying = true; spinner.startAnimation(nil); status.stringValue = text == nil ? "正在缩小并复制表情…" : "正在合成并复制…"
         let finish: (Data?, Error?) -> Void = { data, error in
             var outcome: Result<URL, Error>
             do {
@@ -551,7 +590,13 @@ final class PanelController: NSViewController, NSSearchFieldDelegate, NSCollecti
 }
 
 final class FeishuContextMenu: NSObject {
-    var search: ((String, NSPoint) -> Void)?
+    var search: ((String, NSPoint, PasteDestination?) -> Void)?
+    private let selectionQueue = DispatchQueue(label: "stickerbox.selection", qos: .userInitiated)
+    private var capturedDestination: PasteDestination?
+    private var capturedText = ""
+    private var captureReady = false
+    private var pendingSearch = false
+    private var captureGeneration = 0
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var permissionObserver: NSObjectProtocol?
@@ -599,7 +644,7 @@ final class FeishuContextMenu: NSObject {
             owner.suppressUp = true
             owner.target = app; owner.click = event.location
             owner.point = NSPoint(x: event.location.x, y: (NSScreen.screens.first?.frame.maxY ?? 0) - event.location.y)
-            DispatchQueue.main.async { owner.showMenu() }
+            DispatchQueue.main.async { owner.captureSelectionAndShowMenu() }
             return nil
         }
         let mask = CGEventMask((1 << CGEventType.rightMouseDown.rawValue) | (1 << CGEventType.rightMouseUp.rawValue))
@@ -614,6 +659,29 @@ final class FeishuContextMenu: NSObject {
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
         }
+    }
+    private func captureSelectionAndShowMenu() {
+        captureGeneration += 1
+        let ticket = captureGeneration, location = click
+        let application = target
+        capturedDestination = nil; capturedText = ""; captureReady = false; pendingSearch = false
+        // Capture the actual clicked editor while the menu is open; never scan the whole chat tree.
+        selectionQueue.async {
+            let started = CFAbsoluteTimeGetCurrent()
+            let destination = PasteDestination(application, screenPoint: location)
+            let selected = destination?.editor.flatMap { PasteDestination.attribute($0, kAXSelectedTextAttribute) as? String } ?? ""
+            let captureMillis = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
+            DispatchQueue.main.async {
+                guard ticket == self.captureGeneration else { return }
+                self.capturedDestination = destination
+                self.capturedText = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.captureReady = true
+                let diagnostic = "capture_ms=\(captureMillis) editor=\(destination?.editor != nil) selected=\(selected.count)"
+                try? diagnostic.write(to: Render.cache.appendingPathComponent("last-context.txt"), atomically: true, encoding: .utf8)
+                if self.pendingSearch { self.pendingSearch = false; self.searchText() }
+            }
+        }
+        showMenu()
     }
     private func showMenu() {
         guard !menuOpen else { return }
@@ -634,7 +702,8 @@ final class FeishuContextMenu: NSObject {
     private func sendCommand(_ key: CGKeyCode, completion: (() -> Void)? = nil) {
         guard let app = target, !app.isTerminated else { return }
         app.activate(options: [.activateIgnoringOtherApps])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+        let delay = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier ? 0.02 : 0.12
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
             for down in [true, false] {
                 let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down)
@@ -658,16 +727,26 @@ final class FeishuContextMenu: NSObject {
         }
     }
     @objc private func searchText() {
+        guard captureReady else { pendingSearch = true; return }
+        let anchor = point
+        if !capturedText.isEmpty, capturedText.count <= 100 {
+            search?(capturedText, anchor, capturedDestination)
+            return
+        }
+        // AX is the fast path. Legacy Copy fallback snapshots only original clipboard formats,
+        // avoiding lazily generated TIFF/PNG conversions of an existing GIF.
         let board = NSPasteboard.general
-        // Snapshot every advertised format before using Copy to read Electron's selection.
         let saved = (board.pasteboardItems ?? []).map { item -> NSPasteboardItem in
             let snapshot = NSPasteboardItem()
-            for type in item.types { if let data = item.data(forType: type) { snapshot.setData(data, forType: type) } }
+            let hasFile = item.types.contains(.fileURL)
+            for type in item.types {
+                if hasFile && (type == .tiff || type == .png || type.rawValue.hasPrefix("dyn.") || type.rawValue.hasPrefix("CorePasteboardFlavorType")) { continue }
+                if let data = item.data(forType: type) { snapshot.setData(data, forType: type) }
+            }
             return snapshot
         }
         let before = board.changeCount
-        let anchor = point
-        sendCommand(8) { self.waitForCopy(previous: before, saved: saved, anchor: anchor, attempts: 16) }
+        sendCommand(8) { self.waitForCopy(previous: before, saved: saved, anchor: anchor, attempts: 10) }
     }
     private func waitForCopy(previous: Int, saved: [NSPasteboardItem], anchor: NSPoint, attempts: Int) {
         let board = NSPasteboard.general
@@ -679,13 +758,148 @@ final class FeishuContextMenu: NSObject {
                 if !saved.isEmpty { board.writeObjects(saved) }
             }
             // Empty / oversized selections open an editable search field without sending a query.
-            search?(text.count <= 100 ? text : "", anchor)
+            search?(text.count <= 100 ? text : "", anchor, capturedDestination)
         } else if attempts > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 self.waitForCopy(previous: previous, saved: saved, anchor: anchor, attempts: attempts - 1)
             }
-        } else { search?("", anchor) }
+        } else { search?("", anchor, capturedDestination) }
     }
+}
+
+struct ComposerState: Equatable {
+    let text: String
+    let selectedText: String
+    let images: Int
+    let complete: Bool
+    var imageReferences: [String] = []
+    static func imagePath(_ reference: String) -> String? {
+        if let url = URL(string: reference), url.isFileURL { return url.standardizedFileURL.path }
+        guard let components = URLComponents(string: reference),
+              let path = components.queryItems?.first(where: { $0.name == "path" })?.value else { return nil }
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+    func containsImage(at file: URL) -> Bool {
+        containsOnlyInsertedImage && imageReferences.contains { Self.imagePath($0) == file.standardizedFileURL.path }
+    }
+    static func normalized(_ text: String) -> String {
+        text.replacingOccurrences(of: "\u{200b}", with: "").replacingOccurrences(of: "\u{fffc}", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    var mayReplace: Bool { complete && images == 0 && (text.isEmpty || (!selectedText.isEmpty && selectedText == text)) }
+    var containsOnlyInsertedImage: Bool { complete && text.isEmpty && images == 1 }
+    static func resourceReference(_ node: AXUIElement) -> String? {
+        let labels = [kAXURLAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute].compactMap { name -> String? in
+            let value = PasteDestination.attribute(node, name)
+            if let url = value as? URL { return url.absoluteString }
+            return value as? String
+        }
+        return labels.first { $0.contains("/image?") || $0.hasPrefix("file:") || $0.hasPrefix("blob:") || $0.hasPrefix("data:image/") || $0.hasPrefix("https:") }
+    }
+    static func read(_ editor: AXUIElement) -> ComposerState {
+        guard let raw = PasteDestination.attribute(editor, kAXValueAttribute) as? String else {
+            return ComposerState(text: "", selectedText: "", images: 0, complete: false)
+        }
+        var nodes = [editor], index = 0, images = 0, complete = true
+        var references: [String] = []
+        while index < nodes.count && index < 80 {
+            let node = nodes[index]; index += 1
+            let role = PasteDestination.attribute(node, kAXRoleAttribute) as? String
+            if role == kAXImageRole {
+                if let reference = Self.resourceReference(node) {
+                    images += 1; references.append(reference)
+                } else {
+                    // Ignore a decorative sibling only when its actual image is identifiable.
+                    let parent = PasteDestination.element(node, kAXParentAttribute)
+                    let siblings = parent.flatMap { PasteDestination.attribute($0, kAXChildrenAttribute) as? [AXUIElement] } ?? []
+                    let hasImageSibling = siblings.prefix(12).contains { sibling in
+                        !CFEqual(sibling, node) && PasteDestination.attribute(sibling, kAXRoleAttribute) as? String == kAXImageRole && Self.resourceReference(sibling) != nil
+                    }
+                    if !hasImageSibling { complete = false }
+                }
+            }
+            var children: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(node, kAXChildrenAttribute as CFString, &children)
+            if error == .success, let children = children as? [AXUIElement] {
+                if nodes.count + children.count > 80 { complete = false }
+                nodes.append(contentsOf: children.prefix(max(0, 80 - nodes.count)))
+            } else if error != .success && error != .attributeUnsupported && error != .noValue { complete = false }
+        }
+        return ComposerState(text: normalized(raw), selectedText: normalized(PasteDestination.attribute(editor, kAXSelectedTextAttribute) as? String ?? ""), images: images, complete: complete, imageReferences: references)
+    }
+}
+
+struct PasteDestination {
+    let application: NSRunningApplication
+    let window: AXUIElement?
+    let editor: AXUIElement?
+    let selectedRange: AXValue?
+    let originalText: String?
+    static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value
+    }
+    static func element(_ element: AXUIElement, _ name: String) -> AXUIElement? {
+        guard let value = attribute(element, name), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+    static func isEditor(_ element: AXUIElement) -> Bool {
+        let role = attribute(element, kAXRoleAttribute) as? String
+        return role == kAXTextAreaRole || role == kAXTextFieldRole || (attribute(element, "AXEditable") as? Bool == true)
+    }
+    static func focusedEditor(_ root: AXUIElement, expected: AXUIElement?) -> AXUIElement? {
+        if let focused = element(root, kAXFocusedUIElementAttribute), isEditor(focused) { return focused }
+        if let expected = expected, attribute(expected, kAXFocusedAttribute) as? Bool == true { return expected }
+        return nil
+    }
+    init?(_ application: NSRunningApplication?, screenPoint: CGPoint? = nil) {
+        guard let application = application,
+              ["com.electron.lark", "com.electron.feishu"].contains(application.bundleIdentifier ?? "") else { return nil }
+        self.application = application
+        let root = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.05)
+        let focused = Self.element(root, kAXFocusedUIElementAttribute)
+        var found: AXUIElement?
+        if let focused = focused, Self.isEditor(focused) { found = focused }
+        if found == nil, let location = screenPoint {
+            var hit: AXUIElement?
+            if AXUIElementCopyElementAtPosition(root, Float(location.x), Float(location.y), &hit) == .success {
+                for _ in 0..<7 {
+                    guard let node = hit else { break }
+                    if Self.isEditor(node) { found = node; break }
+                    hit = Self.element(node, kAXParentAttribute)
+                }
+            }
+        }
+        if found == nil, screenPoint != nil, let focused = focused {
+            let deadline = CFAbsoluteTimeGetCurrent() + 0.2
+            var pending = [focused], visited = 0
+            while let current = pending.popLast(), visited < 40, CFAbsoluteTimeGetCurrent() < deadline {
+                visited += 1
+                if Self.isEditor(current) { found = current; break }
+                let role = Self.attribute(current, kAXRoleAttribute) as? String
+                if role == kAXButtonRole || role == kAXImageRole || role == kAXStaticTextRole { continue }
+                if let children = Self.attribute(current, kAXChildrenAttribute) as? [AXUIElement] {
+                    pending.append(contentsOf: children.suffix(max(0, 40 - pending.count)))
+                }
+            }
+        }
+        // Keep the captured editor and window together; an AX document is never a paste target.
+        editor = found
+        originalText = found.flatMap { Self.attribute($0, kAXValueAttribute) as? String }.map { ComposerState.normalized($0) }
+        if let value = found.flatMap({ Self.attribute($0, kAXSelectedTextRangeAttribute) }), CFGetTypeID(value) == AXValueGetTypeID() {
+            selectedRange = (value as! AXValue)
+        } else { selectedRange = nil }
+        var enclosing = found
+        var foundWindow: AXUIElement?
+        for _ in 0..<10 {
+            guard let node = enclosing else { break }
+            if Self.attribute(node, kAXRoleAttribute) as? String == kAXWindowRole { foundWindow = node; break }
+            enclosing = Self.element(node, kAXParentAttribute)
+        }
+        window = foundWindow ?? Self.element(root, kAXFocusedWindowAttribute)
+    }
+
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
@@ -697,11 +911,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private var selectionController: PanelController?
     private var outsideClickMonitor: Any?
     private let feishuMenu = FeishuContextMenu()
+    private var autoSendEnabled: Bool { UserDefaults.standard.bool(forKey: "autoSendSelectedSticker") }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: ["autoSendSelectedSticker": true])
         NSApp.setActivationPolicy(.accessory)
-        feishuMenu.search = { [weak self] text, point in
+        feishuMenu.search = { [weak self] text, point, destination in
             guard let self = self else { return }
-            self.showSelection(text, at: point, source: self.feishuMenu.sourceApplication)
+            self.showSelection(text, at: point, source: self.feishuMenu.sourceApplication, captured: destination)
         }
         feishuMenu.start()
         if CommandLine.arguments.contains("--enable-feishu") {
@@ -742,12 +958,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             menu.addItem(withTitle: "打开表情匣", action: #selector(showMenu), keyEquivalent: "")
             menu.addItem(withTitle: "打开 QQ 调试副本", action: #selector(openQQ), keyEquivalent: "")
             menu.addItem(withTitle: feishuMenu.isRunning ? "飞书右键菜单已启用" : "启用飞书右键菜单…", action: #selector(enableFeishuMenu), keyEquivalent: "")
+            let autoSend = menu.addItem(withTitle: "选择表情后自动发送（Enter）", action: #selector(toggleAutoSend), keyEquivalent: "")
+            autoSend.state = autoSendEnabled ? .on : .off
             menu.addItem(NSMenuItem.separator())
             menu.addItem(withTitle: "退出表情匣", action: #selector(quit), keyEquivalent: "q")
             menu.items.forEach { $0.target = self }
             statusItem.popUpMenu(menu)
         } else if popover?.isShown == true { popover?.performClose(nil) }
         else { show() }
+    }
+    @objc private func toggleAutoSend() {
+        UserDefaults.standard.set(!autoSendEnabled, forKey: "autoSendSelectedSticker")
+        pasteGeneration += 1
+        pasteStatus(autoSendEnabled ? "选择表情后自动发送（Enter）已开启" : "自动发送已关闭，点击后复制并粘贴")
     }
     @objc private func enableFeishuMenu() { feishuMenu.requestPermission() }
     @objc private func showMenu() { show() }
@@ -774,23 +997,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         let source = NSWorkspace.shared.frontmostApplication
         DispatchQueue.main.async { [weak self] in self?.showSelection(text, at: point, source: source) }
     }
-    private func finishCopy(to source: NSRunningApplication?, clipboardVersion: Int) {
+    private var pasteGeneration = 0
+    private func pasteStatus(_ message: String) {
+        statusItem.button?.toolTip = "表情匣：" + message
+        try? message.write(to: Render.cache.appendingPathComponent("last-action.txt"), atomically: true, encoding: .utf8)
+    }
+    private func finishCopy(to destination: PasteDestination?, clipboardVersion: Int) {
+        pasteGeneration += 1
+        let ticket = pasteGeneration
         let front = NSWorkspace.shared.frontmostApplication
-        let mayReturn = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier || front?.processIdentifier == source?.processIdentifier
+        let mayReturn = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier || front?.processIdentifier == destination?.application.processIdentifier
+        // Render.copy has already written the original image, PNG and file URL.
+        // Returning to the chat never clears or restores that clipboard.
         closeSelection(); popover?.performClose(nil)
         NSApp.hide(nil)
-        guard mayReturn, AXIsProcessTrusted(), let source = source, !source.isTerminated,
-              ["com.electron.lark", "com.electron.feishu"].contains(source.bundleIdentifier ?? "") else { return }
-        source.activate(options: [.activateIgnoringOtherApps])
-        // Wait for the original editor to regain focus, then paste once. Never send Return.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == source.processIdentifier,
-                  NSPasteboard.general.changeCount == clipboardVersion else { return }
+        pasteStatus("表情已复制，可手动粘贴")
+        guard mayReturn else { pasteStatus("表情已复制，前台应用已改变，未自动粘贴"); return }
+        guard AXIsProcessTrusted() else { pasteStatus("表情已复制，辅助功能权限未生效，未自动粘贴"); return }
+        guard let destination = destination, destination.editor != nil,
+              !destination.application.isTerminated else { pasteStatus("表情已复制，未定位到原输入框，请手动粘贴"); return }
+        destination.application.activate(options: [.activateIgnoringOtherApps])
+        restoreAndPaste(destination, clipboardVersion: clipboardVersion, ticket: ticket, attempts: 24, restored: false, stable: 0)
+    }
+    private func restoreAndPaste(_ destination: PasteDestination, clipboardVersion: Int, ticket: Int,
+                                 attempts: Int, restored: Bool, stable: Int) {
+        guard ticket == pasteGeneration, NSPasteboard.general.changeCount == clipboardVersion,
+              !destination.application.isTerminated else { return }
+        guard attempts > 0 else { pasteStatus("表情已复制，输入框未就绪，请手动粘贴"); return }
+        let app = destination.application
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.1)
+        let active = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+        var didRestore = restored
+        if active && !restored {
+            if let window = destination.window { AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
+            if let editor = destination.editor {
+                AXUIElementSetAttributeValue(root, kAXFocusedUIElementAttribute as CFString, editor)
+                AXUIElementSetAttributeValue(editor, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            }
+            didRestore = true
+        }
+        let focused = active ? PasteDestination.focusedEditor(root, expected: destination.editor) : nil
+        if active, let expected = destination.editor, focused.map({ !CFEqual($0, expected) }) ?? true { didRestore = false }
+        let currentWindow = active ? PasteDestination.element(root, kAXFocusedWindowAttribute) : nil
+        let sameWindow = destination.window.map { expected in currentWindow.map { CFEqual(expected, $0) } ?? false } ?? true
+        let ready = focused.map { current in
+            PasteDestination.isEditor(current) && (destination.editor.map { CFEqual($0, current) } ?? true)
+        } ?? false
+        let nextStable = active && sameWindow && ready ? stable + 1 : 0
+        if nextStable >= 2 {
+            if let editor = focused, let range = destination.selectedRange,
+               let original = destination.originalText,
+               let current = PasteDestination.attribute(editor, kAXValueAttribute) as? String,
+               ComposerState.normalized(current) == original {
+                // Opening the search window can collapse Chromium's text selection.
+                // Restore it only while the original editor content is unchanged.
+                AXUIElementSetAttributeValue(editor, kAXSelectedTextRangeAttribute as CFString, range)
+            }
             for down in [true, false] {
                 let event = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: down)
                 event?.flags = .maskCommand
-                event?.postToPid(source.processIdentifier)
+                event?.postToPid(app.processIdentifier)
             }
+            pasteStatus("表情已复制，已向飞书输入框执行粘贴")
+            if autoSendEnabled, let editor = focused {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    self?.confirmImageAndSend(destination, editor: editor, clipboardVersion: clipboardVersion,
+                                              ticket: ticket, attempts: 24, previous: nil, stable: 0)
+                }
+            }
+            return
+        }
+        // Short bounded wait only after a click; no background polling or repeated pastes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.restoreAndPaste(destination, clipboardVersion: clipboardVersion, ticket: ticket,
+                                  attempts: attempts - 1, restored: didRestore, stable: nextStable)
+        }
+    }
+    private func confirmImageAndSend(_ destination: PasteDestination, editor: AXUIElement, clipboardVersion: Int,
+                                     ticket: Int, attempts: Int, previous: ComposerState?, stable: Int) {
+        guard autoSendEnabled, ticket == pasteGeneration, NSPasteboard.general.changeCount == clipboardVersion,
+              !destination.application.isTerminated else { return }
+        let root = AXUIElementCreateApplication(destination.application.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.1)
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == destination.application.processIdentifier,
+              let focused = PasteDestination.focusedEditor(root, expected: editor), CFEqual(focused, editor),
+              let expectedWindow = destination.window,
+              let currentWindow = PasteDestination.element(root, kAXFocusedWindowAttribute), CFEqual(expectedWindow, currentWindow) else {
+            pasteStatus("表情已复制，聊天焦点已改变，请手动发送"); return
+        }
+        let state = ComposerState.read(editor)
+        let copiedFile = NSPasteboard.general.string(forType: .fileURL).flatMap { URL(string: $0) }
+        let matchesCopiedImage = copiedFile.map { state.containsImage(at: $0) } ?? false
+        let nextStable = matchesCopiedImage && state == previous ? stable + 1 : 0
+        if nextStable >= 2 {
+            // Explicit user-selected shortcut: trigger exactly once after the image-only check.
+            guard ComposerState.read(editor) == state, ticket == pasteGeneration,
+                  NSPasteboard.general.changeCount == clipboardVersion, autoSendEnabled,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == destination.application.processIdentifier else { return }
+            pasteGeneration += 1
+            for down in [true, false] {
+                let event = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: down)
+                event?.flags = []
+                event?.postToPid(destination.application.processIdentifier)
+            }
+            pasteStatus("表情已复制，已执行一次 Enter 发送")
+            return
+        }
+
+        if state.images > 1 || (!state.text.isEmpty && state.images > 0) {
+            pasteStatus("表情已复制，输入框有其他内容，请手动发送"); return
+        }
+        guard attempts > 0 else {
+            let diagnostic = "表情已复制，未确认本次图片，请手动发送（文字\(state.text.count)字，图片\(state.images)，可读取\(state.complete)）"
+            pasteStatus(diagnostic); return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.confirmImageAndSend(destination, editor: editor, clipboardVersion: clipboardVersion,
+                                      ticket: ticket, attempts: attempts - 1, previous: state, stable: nextStable)
         }
     }
     private func closeSelection() {
@@ -804,11 +1128,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     func windowDidResignKey(_ notification: Notification) {
         if let window = notification.object as? NSWindow, window === selectionWindow { closeSelection() }
     }
-    private func showSelection(_ text: String, at point: NSPoint, source: NSRunningApplication?) {
+    private func showSelection(_ text: String, at point: NSPoint, source: NSRunningApplication?, captured: PasteDestination? = nil) {
+        let destination = captured ?? PasteDestination(source)
         popover?.performClose(nil)
         if selectionWindow == nil {
             let controller = PanelController()
-            controller.didCopy = { [weak self] version in self?.finishCopy(to: source, clipboardVersion: version) }
+            controller.didCopy = { [weak self] version in self?.finishCopy(to: destination, clipboardVersion: version) }
             let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 624, height: 560),
                                  styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
             window.title = "表情匣"; window.titleVisibility = .hidden
@@ -817,6 +1142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             window.contentViewController = controller
             selectionWindow = window; selectionController = controller
         }
+        selectionController?.didCopy = { [weak self] version in self?.finishCopy(to: destination, clipboardVersion: version) }
         guard let window = selectionWindow else { return }
         let screen = NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) } ?? NSScreen.main
         let bounds = (screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)).insetBy(dx: 8, dy: 8)
@@ -833,17 +1159,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
     private func show() {
         let source = NSWorkspace.shared.frontmostApplication
+        let destination = PasteDestination(source)
         closeSelection()
         guard let button = statusItem.button else { return }
         if panel == nil {
             let controller = PanelController(); controller.didCopy = { [weak self] version in
-                self?.finishCopy(to: source, clipboardVersion: version)
+                self?.finishCopy(to: destination, clipboardVersion: version)
                 self?.statusItem.button?.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "已复制")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.statusItem.button?.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "表情匣") }
             }
             let popup = NSPopover(); popup.behavior = .transient; popup.animates = false; popup.delegate = self; popup.contentViewController = controller; popup.contentSize = NSSize(width: 624, height: 560)
             panel = controller; popover = popup
         }
+        panel?.didCopy = { [weak self] version in self?.finishCopy(to: destination, clipboardVersion: version) }
         NSApp.activate(ignoringOtherApps: true)
         popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         panel?.open(); panel?.focusSearch()
@@ -874,6 +1202,49 @@ func selfTest() -> Int32 {
     } catch { fputs("\(error)\n", stderr); return 1 }
 }
 
+if CommandLine.arguments.contains("--test-auto-send-guard") {
+    func state(_ text: String = "", _ images: Int = 0, _ selected: String = "", _ complete: Bool = true) -> ComposerState {
+        ComposerState(text: ComposerState.normalized(text), selectedText: ComposerState.normalized(selected), images: images, complete: complete)
+    }
+    let checks = [state().mayReplace, state("开心", 0, "开心").mayReplace,
+                  !state("草稿开心", 0, "开心").mayReplace, !state("", 1).mayReplace,
+                  state("\u{fffc}\u{200b}", 1).containsOnlyInsertedImage,
+                  !state("草稿", 1).containsOnlyInsertedImage, !state("", 2).containsOnlyInsertedImage,
+                  !state("", 1, "", false).containsOnlyInsertedImage, !state().containsOnlyInsertedImage]
+    let reference = "/image?resource_type=image&path=%2Ftmp%2Fsticker.gif&_uuid=abc"
+    let attachment = ComposerState(text: "", selectedText: "", images: 1, complete: true, imageReferences: [reference])
+    let pathChecks = [attachment.containsImage(at: URL(fileURLWithPath: "/tmp/sticker.gif")),
+                      !attachment.containsImage(at: URL(fileURLWithPath: "/tmp/other.gif")),
+                      ComposerState.imagePath("/image?resource_type=image&key=remote") == nil]
+    guard pathChecks.allSatisfy({ $0 }) else { print("IMAGE_IDENTITY_FAILED"); exit(1) }
+    print("IMAGE_IDENTITY 3/3")
+    print("AUTO_SEND_GUARD \(checks.filter { $0 }.count)/\(checks.count)")
+    exit(checks.allSatisfy { $0 } ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--test-chat-size"), CommandLine.arguments.count > index + 1 {
+    do {
+        let input = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+        let output = try Render.forChat(input)
+        let original = CGImageSourceCreateWithURL(input as CFURL, nil)!
+        let resized = CGImageSourceCreateWithURL(output as CFURL, nil)!
+        guard CGImageSourceGetCount(original) == CGImageSourceGetCount(resized) else { exit(1) }
+        for frame in 0..<CGImageSourceGetCount(resized) {
+            let before = CGImageSourceCopyPropertiesAtIndex(original, frame, nil) as! [CFString: Any]
+            let after = CGImageSourceCopyPropertiesAtIndex(resized, frame, nil) as! [CFString: Any]
+            let width = after[kCGImagePropertyPixelWidth] as! Int, height = after[kCGImagePropertyPixelHeight] as! Int
+            guard max(width, height) <= Render.chatMaxPixels else { exit(1) }
+            let beforeGIF = before[kCGImagePropertyGIFDictionary] as? NSDictionary
+            let afterGIF = after[kCGImagePropertyGIFDictionary] as? NSDictionary
+            if CGImageSourceGetCount(original) > 1 {
+                for key in [kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFUnclampedDelayTime] {
+                    guard beforeGIF?[key] as? Double == afterGIF?[key] as? Double else { exit(1) }
+                }
+            }
+        }
+        print("CHAT_SIZE_OK frames=\(CGImageSourceGetCount(resized)) output=\(output.path)")
+        exit(0)
+    } catch { print(error); exit(1) }
+}
 if CommandLine.arguments.contains("--self-test") { exit(selfTest()) }
 let app = NSApplication.shared
 let delegate = AppDelegate()
